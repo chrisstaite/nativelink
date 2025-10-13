@@ -256,12 +256,15 @@ impl<'a, T: WorkerApiClientTrait, U: RunningActionsManager> LocalWorkerImpl<'a, 
                                 .ok_or_else(|| make_input_err!("Expected execute_request to be set"))
                                 .and_then(|v| DigestHasherFunc::try_from(v.digest_function))
                                 .err_tip(|| "In LocalWorkerImpl::new()")?;
+                            let instance_name = maybe_instance_name
+                                .err_tip(|| "`instance_name` could not be resolved; this is likely an internal error in local_worker.")?;
 
                             let start_action_fut = {
                                 let precondition_script_cfg = self.config.experimental_precondition_script.clone();
                                 let actions_in_transit = self.actions_in_transit.clone();
                                 let worker_id = self.worker_id.clone();
                                 let running_actions_manager = self.running_actions_manager.clone();
+                                let mut grpc_client = self.grpc_client.clone();
                                 self.metrics.clone().wrap(move |metrics| async move {
                                     metrics.preconditions.wrap(preconditions_met(precondition_script_cfg))
                                     .and_then(|()| running_actions_manager.create_and_add_action(worker_id, start_execute))
@@ -280,6 +283,15 @@ impl<'a, T: WorkerApiClientTrait, U: RunningActionsManager> LocalWorkerImpl<'a, 
                                             .clone()
                                             .prepare_action()
                                             .and_then(RunningAction::execute)
+                                            .and_then(|result| async move {
+                                                // Notify that execution has completed so it can schedule a new action.
+                                                drop(grpc_client.execution_complete(ExecuteComplete {
+                                                    worker_id,
+                                                    instance_name,
+                                                    operation_id,
+                                                }).await);
+                                                Ok(result)
+                                            })
                                             .and_then(RunningAction::upload_results)
                                             .and_then(RunningAction::get_finished_result)
                                             // Note: We need ensure we run cleanup even if one of the other steps fail.
@@ -299,8 +311,6 @@ impl<'a, T: WorkerApiClientTrait, U: RunningActionsManager> LocalWorkerImpl<'a, 
                                 let worker_id = self.worker_id.clone();
                                 let running_actions_manager = self.running_actions_manager.clone();
                                 move |res: Result<ActionResult, Error>| async move {
-                                    let instance_name = maybe_instance_name
-                                        .err_tip(|| "`instance_name` could not be resolved; this is likely an internal error in local_worker.")?;
                                     match res {
                                         Ok(mut action_result) => {
                                             // Save in the action cache before notifying the scheduler that we've completed.
